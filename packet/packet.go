@@ -30,8 +30,8 @@ const (
 
 // Packet 是解码后的控制报文。不同报文类型使用不同字段。
 type Packet struct {
-	Type     Type
-	Flags    byte // 固定报头低 4 位
+	Type      Type
+	Flags     byte   // 固定报头低 4 位
 	Remaining []byte // 未解析时保留的原始剩余数据（内部使用）
 
 	// CONNECT

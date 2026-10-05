@@ -2,17 +2,24 @@ package packet
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"unicode/utf8"
 )
 
+// ErrPacketTooLarge 表示报文剩余长度超过调用方设定的单条报文大小上限。
+// 解码错误以 *DecodeError 包装该哨兵，errors.Is 可判定。
+var ErrPacketTooLarge = errors.New("packet exceeds maximum allowed size")
+
 // DecodeError 描述报文解析失败，Reason 可区分失败原因。
 type DecodeError struct {
 	Reason string
+	wrap   error
 }
 
 func (e *DecodeError) Error() string { return "mqtt decode: " + e.Reason }
+func (e *DecodeError) Unwrap() error { return e.wrap }
 
 func decodeErr(format string, args ...any) *DecodeError {
 	return &DecodeError{Reason: fmt.Sprintf(format, args...)}
@@ -38,8 +45,16 @@ var requiredFlags = map[Type]byte{
 	TypeDisconnect:  0,
 }
 
-// ReadPacket 从 r 读取并解析一个完整报文。
+// ReadPacket 从 r 读取并解析一个完整报文（使用协议默认上限）。
 func ReadPacket(r io.Reader) (*Packet, error) {
+	return ReadPacketBounded(r, 0)
+}
+
+// ReadPacketBounded 从 r 读取并解析一个完整报文。
+// maxBytes>0 时，剩余长度一旦超过该值立即拒绝（在分配报文缓冲之前），
+// 返回的错误可被 errors.Is(err, ErrPacketTooLarge) 判定；
+// maxBytes<=0 表示仅受协议上限（268435455）约束。
+func ReadPacketBounded(r io.Reader, maxBytes int) (*Packet, error) {
 	var hdr [1]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return nil, err
@@ -63,6 +78,11 @@ func ReadPacket(r io.Reader) (*Packet, error) {
 	if err != nil {
 		return nil, err
 	}
+	if maxBytes > 0 && remLen > maxBytes {
+		// 不读取、不缓冲报文体：对端声明了超限长度，立即拒绝。
+		return nil, decodeErrWrap(ErrPacketTooLarge,
+			"%s remaining length %d exceeds configured maximum %d", t, remLen, maxBytes)
+	}
 	body := make([]byte, remLen)
 	if _, err := io.ReadFull(r, body); err != nil {
 		return nil, decodeErr("short body: %v", err)
@@ -73,6 +93,10 @@ func ReadPacket(r io.Reader) (*Packet, error) {
 		return nil, err
 	}
 	return p, nil
+}
+
+func decodeErrWrap(wrap error, format string, args ...any) *DecodeError {
+	return &DecodeError{Reason: fmt.Sprintf(format, args...), wrap: wrap}
 }
 
 func readRemainingLength(r io.Reader) (int, error) {

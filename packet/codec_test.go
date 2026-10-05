@@ -2,6 +2,7 @@ package packet
 
 import (
 	"bytes"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -105,4 +106,45 @@ func connectBytes(proto string, level byte, flags byte) []byte {
 	body = append(body, 0x00, 0x01, 'c')          // clientID="c"
 	out := []byte{0x10, byte(len(body))}
 	return append(out, body...)
+}
+
+// TestReadPacketBounded 验证单条报文大小上限：超限在缓冲报文体前拒绝，
+// 错误可被 errors.Is(err, ErrPacketTooLarge) 区分；未超限正常解析。
+func TestReadPacketBounded(t *testing.T) {
+	big := &Packet{Type: TypePublish, QoS: QoS0, Topic: "pl/x", Payload: make([]byte, 500)}
+	raw, err := Encode(big)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+
+	// 上限 128：报文剩余长度远超上限 -> ErrPacketTooLarge，且不读/缓冲报文体
+	if _, err := ReadPacketBounded(bytes.NewReader(raw), 128); err == nil {
+		t.Fatal("expected error for oversized packet, got nil")
+	} else if !errors.Is(err, ErrPacketTooLarge) {
+		var de *DecodeError
+		if !errors.As(err, &de) {
+			t.Fatalf("want *DecodeError wrapping ErrPacketTooLarge, got %T: %v", err, err)
+		}
+		t.Fatalf("errors.Is(err, ErrPacketTooLarge)=false, reason=%q", de.Reason)
+	}
+	t.Logf("oversized packet rejected before buffering body: %v (判定依据: errors.Is ErrPacketTooLarge)", err)
+
+	// 上限 0 表示仅受协议上限约束 -> 正常解析
+	p, err := ReadPacketBounded(bytes.NewReader(raw), 0)
+	if err != nil {
+		t.Fatalf("maxBytes=0 must accept protocol-sized packets: %v", err)
+	}
+	if p.Type != TypePublish || len(p.Payload) != 500 {
+		t.Fatalf("unexpected parse: type=%s payloadLen=%d", p.Type, len(p.Payload))
+	}
+
+	// 上限恰好等于报文剩余长度 -> 边界为“超过才拒绝”，等于不拒绝
+	remLen := len(big.Payload) + 2 + len("pl/x") // payload + 主题长度前缀(2) + 主题
+	if _, err := ReadPacketBounded(bytes.NewReader(raw), remLen); err != nil {
+		t.Fatalf("size == limit must be accepted, got %v", err)
+	}
+	if _, err := ReadPacketBounded(bytes.NewReader(raw), remLen-1); !errors.Is(err, ErrPacketTooLarge) {
+		t.Fatalf("size == limit-1 must be rejected with ErrPacketTooLarge, got %v", err)
+	}
+	t.Logf("boundary: remaining==%d accepted, %d rejected (严格超过上限才拒绝)", remLen, remLen-1)
 }

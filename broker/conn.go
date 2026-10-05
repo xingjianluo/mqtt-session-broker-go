@@ -56,8 +56,11 @@ func (c *conn) run() error {
 	}()
 
 	// 首包必须是 CONNECT
-	p, err := packet.ReadPacket(c.rw)
+	p, err := c.readPacket()
 	if err != nil {
+		if de, ok := err.(*packet.DecodeError); ok && errors.Is(de, packet.ErrPacketTooLarge) {
+			return c.fail(ErrPacketTooLarge, "first packet exceeds size limit: %v", err)
+		}
 		return c.fail(ErrMalformedPacket, "first packet read: %v", err)
 	}
 	if p.Type != packet.TypeConnect {
@@ -92,19 +95,30 @@ func (c *conn) run() error {
 	}()
 
 	for {
-		p, err := packet.ReadPacket(c.rw)
+		p, err := c.readPacket()
 		if err != nil {
-			if reason := c.closeReason(); reason != nil {
-				cause = reason // 被代理主动断开（配额/接管/慢消费者）
-			} else if de, ok := err.(*packet.DecodeError); ok {
-				cause = c.failErr(ErrMalformedPacket, de)
-			} else {
-				cause = err // EOF 等对端断开
+			switch {
+			case errors.Is(err, packet.ErrPacketTooLarge):
+				// 超限在读取/缓冲报文之前拒绝：未触碰会话状态，不留半截。
+				cause = c.failErr(ErrPacketTooLarge, err)
+				log.Printf("[broker] packet too large client=%q cause=%v (判定依据: ErrPacketTooLarge)", sess.ClientID, cause)
+			case c.closeReason() != nil:
+				cause = c.closeReason() // 被代理主动断开（配额/接管/慢消费者）
+			default:
+				if de, ok := err.(*packet.DecodeError); ok {
+					cause = c.failErr(ErrMalformedPacket, de)
+				} else {
+					cause = err // EOF 等对端断开
+				}
 			}
 			log.Printf("[broker] read loop end client=%q cause=%v", sess.ClientID, cause)
 			return cause
 		}
 		log.Printf("[broker] recv client=%q type=%s packetID=%d", sess.ClientID, p.Type, p.PacketID)
+		if p.Type == packet.TypePublish {
+			log.Printf("[broker] recv PUBLISH client=%q topic=%q qos=%d retain=%v dup=%v (会话状态: connected=%v clean=%v backlog=%d)",
+				sess.ClientID, p.Topic, p.QoS, p.Retain, p.Dup, sess.isConnected(), sess.Clean, sess.backlogSize())
+		}
 		if err := c.dispatch(sess, p); err != nil {
 			cause = err
 			return err
@@ -151,7 +165,12 @@ func (c *conn) dispatch(sess *Session, p *packet.Packet) error {
 		}
 	case packet.TypeSubscribe:
 		codes := c.broker.subscribe(sess, p.Subscriptions)
-		return c.send(&packet.Packet{Type: packet.TypeSubAck, PacketID: p.PacketID, ReasonCodes: codes})
+		// SUBACK 必须先于保留消息首投到达；首投已在 subscribe 中入队，发送 SUBACK 后 pump。
+		if err := c.send(&packet.Packet{Type: packet.TypeSubAck, PacketID: p.PacketID, ReasonCodes: codes}); err != nil {
+			return err
+		}
+		c.broker.pump(sess)
+		return nil
 	case packet.TypeUnsubscribe:
 		c.broker.unsubscribe(sess, p.Subscriptions)
 		return c.send(&packet.Packet{Type: packet.TypeUnsubAck, PacketID: p.PacketID})
@@ -163,6 +182,12 @@ func (c *conn) dispatch(sess *Session, p *packet.Packet) error {
 		return c.fail(ErrMalformedPacket, "unexpected packet type %s from client", p.Type)
 	}
 	return nil
+}
+
+// readPacket 按配置的单条报文上限读取并解析报文。
+// 超限时错误可被 errors.Is(err, packet.ErrPacketTooLarge) 判定。
+func (c *conn) readPacket() (*packet.Packet, error) {
+	return packet.ReadPacketBounded(c.rw, c.broker.cfg.MaxPacketSize)
 }
 
 // send 将报文放入异步写出队列。队列满判定为慢消费者并断开。

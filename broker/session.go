@@ -47,7 +47,7 @@ type Session struct {
 
 	subs map[string]byte // filter -> qos
 
-	outbox map[uint16]*outbound     // packetID -> 出站消息（含队列与在途）
+	outbox map[uint16]*outbound      // packetID -> 出站消息（含队列与在途）
 	inQoS2 map[uint16]*packet.Packet // packetID -> 入站 QoS2 消息（等 PUBREL）
 	order  []uint16                  // 出站消息入队顺序（保证 FIFO）
 
@@ -74,6 +74,20 @@ func newSession(clientID string, clean bool, quota int) *Session {
 
 // backlogLocked 返回当前积压条数（队列 + 在途）。调用方需持锁。
 func (s *Session) backlogLocked() int { return len(s.outbox) }
+
+// backlogSize 返回当前积压条数（线程安全，供日志/测试观测）。
+func (s *Session) backlogSize() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.outbox)
+}
+
+// isConnected 返回当前会话是否绑定在线连接（供日志/测试观测）。
+func (s *Session) isConnected() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.connected
+}
 
 // allocPacketIDLocked 分配未使用的出站 packetID。调用方需持锁。
 func (s *Session) allocPacketIDLocked() uint16 {
