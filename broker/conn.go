@@ -56,9 +56,9 @@ func (c *conn) run() error {
 	}()
 
 	// 首包必须是 CONNECT
-	p, err := packet.ReadPacket(c.rw)
+	p, err := packet.ReadPacketLimit(c.rw, c.broker.maxPacketSize)
 	if err != nil {
-		return c.fail(ErrMalformedPacket, "first packet read: %v", err)
+		return c.readFail(nil, "first packet read", err)
 	}
 	if p.Type != packet.TypeConnect {
 		return c.fail(ErrMalformedPacket, "first packet must be CONNECT, got %s", p.Type)
@@ -82,8 +82,8 @@ func (c *conn) run() error {
 		c.broker.disconnect(sess, c, will, false, err)
 		return err
 	}
-	// 恢复未完成投递
-	c.broker.resendPending(sess, c)
+	// 恢复未完成投递：由会话唯一 drainer 按 FIFO 重发在途/队列消息
+	c.broker.resumeDelivery(sess)
 
 	graceful := false
 	var cause error
@@ -92,14 +92,12 @@ func (c *conn) run() error {
 	}()
 
 	for {
-		p, err := packet.ReadPacket(c.rw)
+		p, err := packet.ReadPacketLimit(c.rw, c.broker.maxPacketSize)
 		if err != nil {
 			if reason := c.closeReason(); reason != nil {
 				cause = reason // 被代理主动断开（配额/接管/慢消费者）
-			} else if de, ok := err.(*packet.DecodeError); ok {
-				cause = c.failErr(ErrMalformedPacket, de)
 			} else {
-				cause = err // EOF 等对端断开
+				cause = c.readFail(sess, "read packet", err)
 			}
 			log.Printf("[broker] read loop end client=%q cause=%v", sess.ClientID, cause)
 			return cause
@@ -150,8 +148,8 @@ func (c *conn) dispatch(sess *Session, p *packet.Packet) error {
 			log.Printf("[broker] PUBCOMP for unknown/inactive id=%d client=%q (ignored)", p.PacketID, sess.ClientID)
 		}
 	case packet.TypeSubscribe:
-		codes := c.broker.subscribe(sess, p.Subscriptions)
-		return c.send(&packet.Packet{Type: packet.TypeSubAck, PacketID: p.PacketID, ReasonCodes: codes})
+		// SUBACK 由会话 drainer 在保留首投之后发出；保留首投超配额等错误直接断开。
+		return c.broker.subscribe(sess, p.PacketID, p.Subscriptions)
 	case packet.TypeUnsubscribe:
 		c.broker.unsubscribe(sess, p.Subscriptions)
 		return c.send(&packet.Packet{Type: packet.TypeUnsubAck, PacketID: p.PacketID})
@@ -203,13 +201,36 @@ func (c *conn) closeReason() error {
 	return c.reason
 }
 
-// fail 记录协议违规等原因并返回组合错误。
+// fail 记录协议违规等原因、主动关闭连接并返回组合错误。
 func (c *conn) fail(reason error, format string, args ...any) error {
 	log.Printf("[broker] protocol violation: "+format, args...)
+	c.closeWithReason(reason)
 	return &connError{reason: reason, detail: fmt.Sprintf(format, args...)}
 }
 
+// readFail 区分读循环遇到的报文解码错误：超限为 ErrPacketTooLarge，
+// 其余解码错误为 ErrMalformedPacket；普通 I/O 错误（EOF 等）原样返回。
+// sess 可为 nil（CONNECT 之前），用于日志展示会话状态。
+func (c *conn) readFail(sess *Session, stage string, err error) error {
+	var de *packet.DecodeError
+	if errors.As(err, &de) {
+		reason := ErrMalformedPacket
+		if errors.Is(err, packet.ErrPacketTooLarge) {
+			reason = ErrPacketTooLarge
+		}
+		client := "(pre-connect)"
+		if sess != nil {
+			client = sess.ClientID
+		}
+		log.Printf("[broker] %s client=%q rejected: type/payload violates limit, detail=%v (判定依据: %v, session=%v)",
+			stage, client, err, reason, sess != nil)
+		return c.failErr(reason, err)
+	}
+	return err // EOF 等对端断开
+}
+
 func (c *conn) failErr(reason error, detail error) error {
+	c.closeWithReason(reason)
 	return &connError{reason: reason, detail: detail.Error()}
 }
 

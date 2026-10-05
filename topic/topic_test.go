@@ -69,10 +69,10 @@ func TestMatch(t *testing.T) {
 		{"a/+", "a/b/c", false},
 		{"a/+", "a", false},
 		{"+/+", "a/b", true},
-		{"a/#", "a", true},        // '#' 匹配父级本身
-		{"a/#", "a/b/c", true},    // '#' 匹配任意深度
+		{"a/#", "a", true},     // '#' 匹配父级本身
+		{"a/#", "a/b/c", true}, // '#' 匹配任意深度
 		{"#", "a/b/c", true},
-		{"#", "$SYS/x", false},    // 通配符不匹配 $ 系统主题
+		{"#", "$SYS/x", false}, // 通配符不匹配 $ 系统主题
 		{"+/x", "$SYS/x", false},
 		{"$SYS/#", "$SYS/x", true},
 		{"sport/+/player1", "sport/tennis/player1", true},

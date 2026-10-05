@@ -198,7 +198,7 @@ func TestWillMessage(t *testing.T) {
 	wc := &testClient{t: t, nc: c1, done: done}
 	wc.send(&packet.Packet{Type: packet.TypeConnect, ClientID: "dev-will", CleanSession: true,
 		HasWill: true, WillTopic: "status/dev-will", WillPayload: []byte("offline"), WillQoS: 0})
-	wc.read() // CONNACK
+	wc.read()     // CONNACK
 	wc.nc.Close() // 异常断开
 	<-done
 	m := watcher.read()
